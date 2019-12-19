@@ -84,6 +84,7 @@ namespace {
   const char* RCV_IRREV_ONLY_OPT = "irreversible-only";
   const char* RCV_START_BLOCK_OPT = "start-block";
   const char* RCV_END_BLOCK_OPT = "end-block";
+  const char* RCV_STALE_DEADLINE_OPT = "stale-deadline";
 
   const char* RCV_MODE_SCAN = "scan";
   const char* RCV_MODE_SCAN_NOEXP = "scan-noexport";
@@ -242,15 +243,19 @@ public:
     _abi_removals_chan(app().get_channel<chronicle::channels::abi_removals>()),
     _abi_errors_chan(app().get_channel<chronicle::channels::abi_errors>()),
     _table_row_updates_chan(app().get_channel<chronicle::channels::table_row_updates>()),
+    _permission_updates_chan(app().get_channel<chronicle::channels::permission_updates>()),
+    _permission_link_updates_chan(app().get_channel<chronicle::channels::permission_link_updates>()),
+    _account_metadata_updates_chan(app().get_channel<chronicle::channels::account_metadata_updates>()),
     _receiver_pauses_chan(app().get_channel<chronicle::channels::receiver_pauses>()),
     _block_completed_chan(app().get_channel<chronicle::channels::block_completed>()),
-    mytimer(std::ref(app().get_io_service()))
+    pause_timer(std::ref(app().get_io_service())),
+    stale_check_timer(std::ref(app().get_io_service()))
   {};
 
   shared_ptr<chainbase::database>       db;
   bip::mapped_region                    _dblock_mapped_region;
   chronicle::shmem_lock*                dblock;
-  
+
   shared_ptr<tcp::resolver>             resolver;
   shared_ptr<websocket::stream<tcp::socket>> stream;
   const int                             stream_priority = 40;
@@ -282,6 +287,7 @@ public:
   checksum256                           irreversible_id = {};
   uint32_t                              first_bulk      = 0;
   abieos::block_timestamp               block_timestamp;
+  uint32_t                              received_blocks = 0;
 
   // needed for decoding state history input
   map<string, abi_type>                 abi_types;
@@ -300,6 +306,9 @@ public:
   chronicle::channels::abi_removals::channel_type&        _abi_removals_chan;
   chronicle::channels::abi_errors::channel_type&          _abi_errors_chan;
   chronicle::channels::table_row_updates::channel_type&   _table_row_updates_chan;
+  chronicle::channels::permission_updates::channel_type&  _permission_updates_chan;
+  chronicle::channels::permission_link_updates::channel_type&  _permission_link_updates_chan;
+  chronicle::channels::account_metadata_updates::channel_type&  _account_metadata_updates_chan;
   chronicle::channels::receiver_pauses::channel_type&     _receiver_pauses_chan;
   chronicle::channels::block_completed::channel_type&     _block_completed_chan;
 
@@ -308,9 +317,13 @@ public:
   bool                                  exporter_will_ack = false;
   uint32_t                              exporter_acked_block = 0;
   uint32_t                              exporter_max_unconfirmed;
-  boost::asio::deadline_timer           mytimer;
+  boost::asio::deadline_timer           pause_timer;
   uint32_t                              pause_time_msec = 0;
   bool                                  slowdown_requested = false;
+
+  boost::asio::deadline_timer           stale_check_timer;
+  uint32_t                              stale_check_last_head;
+  uint32_t                              stale_check_deadline_msec;
 
 
   void init() {
@@ -365,7 +378,7 @@ public:
         did_undo = true;
       }
     }
-    
+
     const auto& idx = db->get_index<chronicle::state_index, chronicle::by_id>();
     auto itr = idx.begin();
     if( itr != idx.end() ) {
@@ -458,6 +471,17 @@ public:
                continue_read();
              });
          }));
+
+    stale_check_last_head = head;
+    stale_check_timer.expires_from_now(boost::posix_time::milliseconds(stale_check_deadline_msec));
+    stale_check_timer.async_wait
+      (app().get_priority_queue().wrap
+       (stream_priority,
+        [this](const error_code ec) {
+          callback(ec, "async_wait", [&] {
+                                       check_stale_head();
+                                     });
+        }));
   }
 
 
@@ -508,8 +532,8 @@ public:
         ilog("Pausing the reader");
       }
 
-      mytimer.expires_from_now(boost::posix_time::milliseconds(pause_time_msec));
-      mytimer.async_wait
+      pause_timer.expires_from_now(boost::posix_time::milliseconds(pause_time_msec));
+      pause_timer.async_wait
         (app().get_priority_queue().wrap(stream_priority, [this](const error_code ec) {
             callback(ec, "async_wait", [&] {
                 continue_read();
@@ -520,7 +544,28 @@ public:
     return true;
   }
 
-  void receive_abi(const shared_ptr<flat_buffer>& p) {
+
+  void check_stale_head() {
+    if( stale_check_last_head == head && pause_time_msec == 0 && received_blocks > 0 ) {
+      elog("Did not receive anything in ${d} milliseconds. Aborting the receiver", ("d", stale_check_deadline_msec));
+      abort_receiver();
+    }
+    else {
+      stale_check_last_head = head;
+      stale_check_timer.expires_from_now(boost::posix_time::milliseconds(stale_check_deadline_msec));
+      stale_check_timer.async_wait
+        (app().get_priority_queue().wrap
+         (stream_priority,
+          [this](const error_code ec) {
+            callback(ec, "async_wait", [&] {
+                                         check_stale_head();
+                                       });
+          }));
+    }
+  }
+
+
+  void receive_abi(const shared_ptr<flat_buffer> p) {
     auto data = p->data();
     std::string error;
     abi_def abi{};
@@ -638,6 +683,8 @@ public:
     if (!result.this_block)
       return true;
 
+    received_blocks++;
+
     uint32_t    last_irreversible_num = result.last_irreversible.block_num;
 
     uint32_t    block_num = result.this_block->block_num;
@@ -647,7 +694,7 @@ public:
       if( block_num == end_block_num-1 ) {
         interactive_req_pending = false;
         process_interactive_reqs();
-      }      
+      }
     }
     else {
       bip::scoped_lock<bip::interprocess_mutex> lock(dblock->mutex);
@@ -664,7 +711,7 @@ public:
                ("b", block_num)("i", irreversible));
           throw runtime_error("Received block number that is lower than last seen irreversible");
         }
-          
+
         // we're at the blockchain head
         if (block_num <= head) { //received a block that is lower than what we already saw
           ilog("fork detected at block ${b}; head=${h}", ("b",block_num)("h",head));
@@ -723,10 +770,10 @@ public:
             itr = idx.begin();
           }
         }
-        
+
         if (result.deltas)
           receive_deltas(*result.deltas);
-        
+
         save_state();
         undo_session.push();     // save a new revision
         commit_db();
@@ -735,7 +782,7 @@ public:
       if (result.deltas)
         receive_deltas(*result.deltas);
     }
-      
+
     if (result.traces)
       receive_traces(*result.traces);
 
@@ -761,8 +808,8 @@ public:
       if (report_every > 0 && head % report_every == 0) {
         uint64_t free_bytes = db->get_segment_manager()->get_free_memory();
         uint64_t size = db->get_segment_manager()->get_size();
-        ilog("block=${h}; irreversible=${i}; dbmem_free=${m}",
-             ("h",head)("i",irreversible)("m", free_bytes*100/size));
+        ilog("block=${h}; irreversible=${i}; dbmem_free=${m}; received_blocks=${t}",
+             ("h",head)("i",irreversible)("m", free_bytes*100/size)("t",received_blocks));
         if( exporter_will_ack )
           ilog("Exporter acknowledged block=${b}, unacknowledged=${u}",
                ("b", exporter_acked_block)("u", head-exporter_acked_block));
@@ -873,6 +920,41 @@ public:
             }
           }
         }
+        else if (bltd->table_delta.name == "permission" && _permission_updates_chan.has_subscribers() ) {
+          for (auto& row : bltd->table_delta.rows) {
+            auto pu = std::make_shared<chronicle::channels::permission_update>();
+            pu->block_num = head;
+            pu->block_timestamp = block_timestamp;
+            string error;
+            if (!bin_to_native(pu->permission, error, row.data))
+              throw runtime_error("cannot read permission object" + error);
+            pu->added = row.present;
+            _permission_updates_chan.publish(channel_priority, pu);
+          }
+        }
+        else if (bltd->table_delta.name == "permission_link" && _permission_link_updates_chan.has_subscribers() ) {
+          for (auto& row : bltd->table_delta.rows) {
+            auto plu = std::make_shared<chronicle::channels::permission_link_update>();
+            plu->block_num = head;
+            plu->block_timestamp = block_timestamp;
+            string error;
+            if (!bin_to_native(plu->permission_link, error, row.data))
+              throw runtime_error("cannot read permission_link object" + error);
+            plu->added = row.present;
+            _permission_link_updates_chan.publish(channel_priority, plu);
+          }
+        }
+        else if (bltd->table_delta.name == "account_metadata" && _account_metadata_updates_chan.has_subscribers() ) {
+          for (auto& row : bltd->table_delta.rows) {
+            auto amu = std::make_shared<chronicle::channels::account_metadata_update>();
+            amu->block_num = head;
+            amu->block_timestamp = block_timestamp;
+            string error;
+            if (!bin_to_native(amu->account_metadata, error, row.data))
+              throw runtime_error("cannot read account_metadata object" + error);
+            _account_metadata_updates_chan.publish(channel_priority, amu);
+          }
+        }
       }
       _block_table_deltas_chan.publish(channel_priority, bltd);
     }
@@ -898,7 +980,7 @@ public:
       if( itr != idx.end() ) {
         // dlog("Clearing contract ABI for ${a}", ("a",(std::string)account));
         db->remove(*itr);
-        
+
         auto ar =  std::make_shared<chronicle::channels::abi_removal>();
         ar->block_num = head;
         ar->block_timestamp = block_timestamp;
@@ -1189,6 +1271,7 @@ void receiver_plugin::set_program_options( options_description& cli, options_des
      "Start from a snapshot block instead of genesis")
     (RCV_END_BLOCK_OPT, bpo::value<uint32_t>()->default_value(std::numeric_limits<uint32_t>::max()),
      "Stop receiver before this block number")
+    (RCV_STALE_DEADLINE_OPT, bpo::value<uint32_t>()->default_value(10000), "Stale socket deadline, msec")
     ;
 }
 
@@ -1218,15 +1301,15 @@ void receiver_plugin::plugin_initialize( const variables_map& options ) {
       my->noexport_mode = false;
       my->interactive_mode = true;
       my->irreversible_only = true;
-    }    
+    }
 
     ilog("Starting in ${m} mode", ("m", receiver_mode));
-      
+
     string dbdir = app().data_dir().native() + "/receiver-state";
     bfs::create_directories(dbdir);
 
     bool new_lock = false;
-    string dblock_shm_file = dbdir + "/lock.bin";  
+    string dblock_shm_file = dbdir + "/lock.bin";
     if(!bfs::exists(dblock_shm_file)) {
       std::ofstream ofs(dblock_shm_file, std::ofstream::trunc);
       ofs.close();
@@ -1258,13 +1341,13 @@ void receiver_plugin::plugin_initialize( const variables_map& options ) {
           (dbdir, chainbase::database::read_write,
            options.at(RCV_DBSIZE_OPT).as<uint32_t>() * 1024*1024);
       }
-      
+
       my->db->add_index<chronicle::state_index>();
       my->db->add_index<chronicle::received_block_index>();
       my->db->add_index<chronicle::contract_abi_index>();
       my->db->add_index<chronicle::contract_abi_hist_index>();
     }
-    
+
     my->resolver = std::make_shared<tcp::resolver>(std::ref(app().get_io_service()));
 
     my->stream = std::make_shared<websocket::stream<tcp::socket>>(std::ref(app().get_io_service()));
@@ -1287,7 +1370,7 @@ void receiver_plugin::plugin_initialize( const variables_map& options ) {
     my->skip_traces = options.at(RCV_SKIP_TRACES_OPT).as<bool>();
     if( my->skip_traces )
       ilog("Skipping transaction trace events");
-    
+
     if( my->irreversible_only )
       ilog("Fetching irreversible blocks only");
 
@@ -1297,6 +1380,8 @@ void receiver_plugin::plugin_initialize( const variables_map& options ) {
     }
 
     my->end_block_num = options.at(RCV_END_BLOCK_OPT).as<uint32_t>();
+
+    my->stale_check_deadline_msec = options.at(RCV_STALE_DEADLINE_OPT).as<uint32_t>();
 
     my->blacklist_actions.emplace
       (std::make_pair(abieos::name("eosio"),
@@ -1327,8 +1412,8 @@ void receiver_plugin::start_after_dependencies() {
 
   if( mustwait ) {
     ilog("Waiting for dependent plugins");
-    my->mytimer.expires_from_now(boost::posix_time::milliseconds(50));
-    my->mytimer.async_wait(boost::bind(&receiver_plugin::start_after_dependencies, this));
+    my->pause_timer.expires_from_now(boost::posix_time::milliseconds(50));
+    my->pause_timer.async_wait(boost::bind(&receiver_plugin::start_after_dependencies, this));
   }
   else {
     ilog("All dependent plugins started, launching the receiver");
